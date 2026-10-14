@@ -49,9 +49,11 @@ Windows:       %APPDATA%\douyin-learning-note\config.json
   "asr_backend": "auto",
   "model": "mlx-community/whisper-large-v3-mlx",
   "faster_model": "large-v3",
-  "faster_device": "auto",
-  "faster_compute_type": "auto",
+  "faster_device": "cpu",
+  "faster_compute_type": "int8",
   "browser_channel": "auto",
+  "browser_profile_dir": "",
+  "headless": false,
   "work_root": ""
 }
 ```
@@ -61,7 +63,10 @@ Windows:       %APPDATA%\douyin-learning-note\config.json
 - `vault_path`：`<用户目录>/Desktop/Note`（Windows 即 `C:\Users\<你>\Desktop\Note`，macOS 即 `/Users/<你>/Desktop/Note`）
 - `work_root`：Windows `%LOCALAPPDATA%\douyin-learning-note\sessions`；macOS `~/Library/Caches/douyin-learning-note/sessions`；Linux `~/.cache/douyin-learning-note/sessions`
 - `asr_backend`：`auto` = macOS 用 `mlx`，Windows/Linux 用 `faster`
+- `faster_device` / `faster_compute_type`：默认 `cpu` + `int8`（不挑环境）。有可用 CUDA 时改 `cuda` + `float16`；写成 `auto` 但在缺 cuBLAS 的机器上会先失败再自动回退 CPU。
 - `browser_channel`：`auto` = 自动探测系统浏览器；也可指定 `chrome` / `msedge` / `chromium`（自带内核，需先 `playwright install chromium`）或某个浏览器可执行文件的绝对路径
+- `browser_profile_dir`：留空则用 `<缓存目录>/browser-profile` 的固定 profile（复用 Cookie，避免每次都被当新访客触发验证码）
+- `headless`：默认 `false`。抖音对 headless + 全新 profile 会直接弹验证码、详情页不渲染，所以抓取用**有头模式**；抓取时会短暂弹出一个浏览器窗口，属正常现象。
 
 用户说“保存到某个目录”时，把对应路径作为 `--vault` 或 `--subdir` 传给 `start`。用户说“重新整理并覆盖”时传 `--force`。
 
@@ -126,6 +131,9 @@ Windows:       %APPDATA%\douyin-learning-note\config.json
 - 转写依赖 `ffmpeg` 和 `uv`。没装 `uv` 时先装：Windows `winget install --id astral-sh.uv -e`（或 `python -m pip install --user uv`），macOS/Linux `curl -LsSf https://astral.sh/uv/install.sh | sh`。
 - worker 的依赖由脚本按平台临时拉起（macOS：`mlx-whisper`；Windows/Linux：`faster-whisper`），首次运行会从镜像下载模型，之后走缓存。
 - 网络必须能访问 `pypi.tuna.tsinghua.edu.cn` 和 `hf-mirror.com`；脚本默认已经设置这两个镜像。
+- **系统代理陷阱**：Windows 上 Python 的 `requests` 会自动继承系统/IE 代理（常见是 Clash 之类），如果那个代理转发不了外网，就会出现「curl 直连正常、Python 连接被重置」。脚本在 `proxy_url` 为空时会强制直连（`NO_PROXY=*`），需要代理时把 `proxy_url` 配上即可（抓取与模型下载同时生效）。
+- 抓取用**有头模式**（`headless: false`）。第一次运行如果弹出的窗口里出现验证码，手动过一次即可；profile 会保留在 `browser_profile_dir`，后续复用，不需要每次都过。
+- Windows/Linux 转写走 `faster-whisper`，默认 CPU `int8`；模型（`large-v3`）约 3 GB，首次运行从 `hf-mirror.com` 下载，之后走本地缓存。FFmpeg 已经生成 16k 单声道 WAV，脚本直接把采样数组交给模型，不经过 PyAV 解码（新版 PyAV 与 faster-whisper 存在 `metadata_errors` 参数不兼容）。
 - 抖音必须识别为大陆出口。若 worker 报 `GeoBlockedError`，让用户关闭 VPN 或配置大陆代理，然后重新调用。
 - 如果需要常驻大陆代理，在共享配置里设置 `proxy_url`，例如 `http://127.0.0.1:7890`；Codex、Qoder 和 DSH 会读取同一份配置。
 - 只支持公开可访问的视频。登录、私密或已删除视频不要绕过权限，直接报告失败。

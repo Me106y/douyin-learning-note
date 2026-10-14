@@ -17,11 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 APP_NAME = "douyin-learning-note"
-VERSION = "1.1.0"
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-)
+VERSION = "1.2.0"
 URL_RE = re.compile(r"https?://[^\s]+")
 
 
@@ -62,14 +58,41 @@ def default_vault_path() -> str:
     return str(Path.home() / "Desktop" / "Note")
 
 
+def default_user_agent() -> str:
+    """UA 与真实运行平台保持一致，避免伪造 UA 触发抖音风控。"""
+    plat = current_platform()
+    if plat == "windows":
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"
+        )
+    if plat == "macos":
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+    )
+
+
+def default_browser_profile_dir() -> str:
+    """固定浏览器 profile：复用 Cookie/指纹，避免每次都被当新访客而触发验证码。"""
+    return str(Path(default_work_root()).expanduser().parent / "browser-profile")
+
+
+UA = default_user_agent()
+
+
 DEFAULT_CONFIG: Dict[str, Any] = {
     "vault_path": default_vault_path(),
     "note_subdir": "学习/视频笔记",
     "asr_backend": "auto",
     "model": "mlx-community/whisper-large-v3-mlx",
     "faster_model": "large-v3",
-    "faster_device": "auto",
-    "faster_compute_type": "auto",
+    "faster_device": "cpu",
+    "faster_compute_type": "int8",
     "faster_vad_filter": True,
     "language": "zh",
     "word_timestamps": False,
@@ -78,7 +101,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "pypi_index": "https://pypi.tuna.tsinghua.edu.cn/simple",
     "hf_endpoint": "https://hf-mirror.com",
     "browser_channel": "auto",
-    "headless": True,
+    "browser_profile_dir": "",
+    "user_agent": "",
+    "headless": False,
     "proxy_url": "",
     "keep_temp_on_failure": True,
     "work_root": default_work_root(),
@@ -178,6 +203,26 @@ def load_config() -> Dict[str, Any]:
 
 def work_root(config: Dict[str, Any]) -> Path:
     return Path(config.get("work_root") or default_work_root()).expanduser()
+
+
+def apply_network_env(config: Dict[str, Any]) -> None:
+    """把代理意图落到进程环境变量。
+
+    Windows 上 Python 的 requests 会自动继承系统/IE 代理设置（常见是 Clash 之类），
+    即使配置里没写 proxy_url 也会被套上代理，于是出现「curl 直连正常、Python 连接被重置」。
+    这里显式表达意图：配了 proxy_url 就用它，没配就强制直连。
+    """
+    proxy = (config.get("proxy_url") or "").strip()
+    if proxy:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ[key] = proxy
+        os.environ.pop("NO_PROXY", None)
+        os.environ.pop("no_proxy", None)
+        return
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+        os.environ.pop(key, None)
 
 
 def session_dir(config: Dict[str, Any], session_id: str) -> Path:
@@ -524,6 +569,7 @@ def quick_geo_blocked(url: str) -> bool:
 
 def start_command(args: argparse.Namespace) -> int:
     config = load_config()
+    apply_network_env(config)
     text = args.input
     share_url = extract_url(text)
     share_author, share_title = parse_share_text(text)
@@ -607,7 +653,8 @@ def capture_video(config: Dict[str, Any], manifest: Dict[str, Any], path: Path) 
     video_id = manifest.get("video_id")
     share_url = manifest["share_url"]
     canonical_url = f"https://www.douyin.com/video/{video_id}" if video_id else share_url
-    profile_dir = path / "chrome-profile"
+    profile_dir = Path(config.get("browser_profile_dir") or default_browser_profile_dir()).expanduser()
+    profile_dir.mkdir(parents=True, exist_ok=True)
     media_requests: List[Dict[str, Any]] = []
     metadata: Dict[str, Any] = {}
     success = False
@@ -629,9 +676,10 @@ def capture_video(config: Dict[str, Any], manifest: Dict[str, Any], path: Path) 
             proxy = {"server": config["proxy_url"]} if config.get("proxy_url") else None
             launch_kwargs: Dict[str, Any] = {
                 "user_data_dir": str(profile_dir),
-                "headless": bool(config.get("headless", True)),
+                "headless": bool(config.get("headless", False)),
                 "locale": "zh-CN",
-                "user_agent": UA,
+                "user_agent": config.get("user_agent") or UA,
+                "viewport": {"width": 1440, "height": 900},
                 "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--no-first-run",
@@ -642,6 +690,10 @@ def capture_video(config: Dict[str, Any], manifest: Dict[str, Any], path: Path) 
             if browser.get("channel"):
                 launch_kwargs["channel"] = browser["channel"]
             context = play.chromium.launch_persistent_context(**launch_kwargs)
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                "window.chrome = window.chrome || {runtime: {}};"
+            )
             page = context.new_page()
             page.on("request", on_request)
 
@@ -666,8 +718,19 @@ def capture_video(config: Dict[str, Any], manifest: Dict[str, Any], path: Path) 
                 raise GeoBlockedError(
                     "抖音识别当前网络不是大陆出口。请关闭 VPN 或配置大陆代理后重试。"
                 )
-            page.wait_for_selector("video", timeout=30000)
+            # 抖音的 <video> 可能先以隐藏占位出现，所以等到 attached 再轮询到可解析时长
+            page.wait_for_selector("video", state="attached", timeout=45000)
             video = page.locator("video").first
+            for _ in range(30):
+                try:
+                    ready = bool(video.evaluate(
+                        "e => e.readyState >= 1 || (Number.isFinite(e.duration) && e.duration > 0)"
+                    ))
+                except Exception:
+                    ready = False
+                if ready:
+                    break
+                page.wait_for_timeout(1000)
 
             try:
                 duration = video.evaluate("e => Number.isFinite(e.duration) ? e.duration : null")
@@ -746,8 +809,7 @@ def capture_video(config: Dict[str, Any], manifest: Dict[str, Any], path: Path) 
                 context.close()
             except Exception:
                 pass
-        if success:
-            shutil.rmtree(profile_dir, ignore_errors=True)
+        # 保留 profile（Cookie/指纹/已通过的验证码），下次运行不必重新过风控
 
     ffmpeg = find_ffmpeg()
     wav_path = path / "audio.wav"
@@ -781,17 +843,39 @@ def transcribe_with_mlx(config: Dict[str, Any], wav_path: str) -> Dict[str, Any]
     )
 
 
-def transcribe_with_faster(config: Dict[str, Any], wav_path: str) -> Dict[str, Any]:
-    """Windows / Linux 转写：CTranslate2 后端，CPU 或 CUDA 均可。"""
+def load_wav_float32(wav_path: str) -> Any:
+    """把 16k 单声道 WAV 读成 float32 数组。
+
+    faster-whisper 默认用 PyAV 解码音频，但新版 PyAV（19.x）移除了它依赖的
+    `metadata_errors` 参数，会直接 TypeError。传入 ndarray 可以跳过 PyAV 解码路径，
+    也省掉一次重采样（ffmpeg 已经输出 16k 单声道）。
+    """
+    import wave
+
+    import numpy as np
+
+    with wave.open(str(wav_path), "rb") as handle:
+        channels = handle.getnchannels()
+        width = handle.getsampwidth()
+        rate = handle.getframerate()
+        frames = handle.readframes(handle.getnframes())
+    if width != 2:
+        raise TranscriptionError(f"WAV 位深不支持：{width * 8}bit（需要 16bit）")
+    if rate != 16000:
+        raise TranscriptionError(f"WAV 采样率不支持：{rate}Hz（需要 16000Hz）")
+    data = np.frombuffer(frames, dtype="<i2")
+    if channels > 1:
+        data = data.reshape(-1, channels).mean(axis=1)
+    return (data.astype("float32")) / 32768.0
+
+
+def _faster_transcribe_once(config: Dict[str, Any], audio: Any, model_ref: str,
+                            device: str, compute_type: str, note: str = "") -> Dict[str, Any]:
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(
-        str(config.get("faster_model") or "large-v3"),
-        device=str(config.get("faster_device") or "auto"),
-        compute_type=str(config.get("faster_compute_type") or "auto"),
-    )
+    model = WhisperModel(model_ref, device=device, compute_type=compute_type)
     segment_iter, info = model.transcribe(
-        str(wav_path),
+        audio,
         language=config.get("language") or None,
         word_timestamps=bool(config.get("word_timestamps", False)),
         vad_filter=bool(config.get("faster_vad_filter", True)),
@@ -804,8 +888,32 @@ def transcribe_with_faster(config: Dict[str, Any], wav_path: str) -> Dict[str, A
     return {
         "text": "".join(segment["text"] for segment in segments).strip(),
         "language": getattr(info, "language", None),
+        "device": f"{device}/{compute_type}" + (f"（{note}）" if note else ""),
         "segments": segments,
     }
+
+
+def transcribe_with_faster(config: Dict[str, Any], wav_path: str) -> Dict[str, Any]:
+    """Windows / Linux 转写：CTranslate2 后端，CPU 或 CUDA 均可。
+
+    device=auto/cuda 在有 NVIDIA 卡但没装 cuBLAS 的机器上会在**转写时**抛
+    「Library cublas64_12.dll is not found」（构造模型时不报错），所以回退必须包住整段转写。
+    """
+    audio = load_wav_float32(wav_path)
+    model_ref = str(config.get("faster_model") or "large-v3")
+    device = str(config.get("faster_device") or "cpu")
+    compute_type = str(config.get("faster_compute_type") or "int8")
+    try:
+        return _faster_transcribe_once(config, audio, model_ref, device, compute_type)
+    except Exception as exc:
+        message = str(exc).lower()
+        gpu_markers = ("cublas", "cudnn", "cuda", "nvidia", "gpu")
+        if device == "cpu" or not any(marker in message for marker in gpu_markers):
+            raise
+        return _faster_transcribe_once(
+            config, audio, model_ref, "cpu", "int8",
+            note=f"已从 {device}/{compute_type} 回退：{type(exc).__name__}",
+        )
 
 
 def transcribe_audio(config: Dict[str, Any], wav_path: str, path: Path) -> Dict[str, Any]:
@@ -871,6 +979,7 @@ def start_progress_thread(config: Dict[str, Any], session_id: str,
 
 def worker_command(args: argparse.Namespace) -> int:
     config = load_config()
+    apply_network_env(config)
     session_id = args.session
     path = resolve_session_dir(config, session_id)
     manifest = read_json(path / "manifest.json", {}) or {}
@@ -1065,6 +1174,7 @@ def commit_command(args: argparse.Namespace) -> int:
 
 def doctor_command(args: argparse.Namespace) -> int:
     config = load_config()
+    apply_network_env(config)
     warnings: List[str] = []
     plat = current_platform()
     backend = resolve_asr_backend(config)

@@ -2,7 +2,7 @@
   "name": "douyin-learning-note",
   "displayName": "抖音学习视频笔记",
   "description": "将抖音学习/面试讲解视频整理为 Obsidian 笔记，支持本地转写、问答整理、思维导图、标题生成和自动写库。",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "entry": "SKILL.md",
   "platforms": ["windows", "macos", "linux"]
 }
